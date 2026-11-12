@@ -39,7 +39,7 @@ function connect() {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (!["download", "status", "cancel"].includes(msg.type)) return false;
+  if (!["download", "status", "cancel", "inspect"].includes(msg.type)) return false;
 
   const id = nextId++;
   pending.set(id, sendResponse);

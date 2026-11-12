@@ -11,6 +11,7 @@ Works with Chrome, Chromium, Brave, Edge, Opera and Vivaldi. Firefox is not supp
 ## Features
 
 - Checkboxes on every video in your history, plus **Select all** / **Clear**
+- **Quick select**: pick only songs (or non-songs), filter by length, and choose a range such as your 30 most recent songs, no matter how many other videos are in between
 - MP4 (up to best available), MP3 or M4A, with a quality choice
 - Live progress: a bar on each video, a status badge, and an overall progress bar in the panel
 - **Cancel** a single download with the ✕ on its badge, or everything with **Cancel all**; partial files of cancelled downloads are cleaned up
@@ -104,6 +105,25 @@ Helper data folder:
 
 `host.log` in that folder shows why a download failed.
 
+### Quick select (filters)
+
+Open **Quick select** in the panel to pick videos without ticking boxes one by one:
+
+| Field | Meaning |
+| --- | --- |
+| **Type** | *Any video*, *Songs (Music)* or *Not songs* |
+| **Length (min)** | Optional shortest and longest length in minutes |
+| **Videos #** | Which matching videos to take, counted from the most recent. `1`–`30` = the 30 most recent matches; `31`–`60` = the next 30 |
+
+Examples:
+- **30 most recent songs:** Type *Songs*, Videos # `1`–`30`, press **Select**.
+- **Songs, but no long mixes:** also set Length max to `10`.
+- **Everything from the 5th to the 20th video:** Type *Any video*, Videos # `5`–`20`.
+
+**Select** replaces your current selection. It scrolls the history to load more videos when needed, checks them in order, and stops as soon as it has enough. Press **Stop** to abort without changing your selection. Then review the ticked videos and press **Download** as usual.
+
+How songs are detected: the helper asks yt-dlp for each video's YouTube category, and a video counts as a song when it is in **Music**. That is accurate but not perfect: DJ mixes, concerts and some podcasts are also filed under Music, so use the length limit to skip them. Checking takes a couple of seconds per new video (four at a time); results are cached in `meta-cache.json` in the helper's data folder, so repeating a search is fast. Videos that can't be checked (private, deleted, age-restricted) are skipped and counted in the status line. *Any video* without a length limit doesn't need any lookups.
+
 ## Updating and uninstalling
 
 - yt-dlp updates itself at most once a day (the bundled binary only).
@@ -117,6 +137,7 @@ Helper data folder:
 - **"ffmpeg not found"**: install ffmpeg or use `--bundled-ffmpeg` (see above).
 - **Download errors about a JavaScript runtime**: install deno (`winget install DenoLand.Deno` on Windows) or node.
 - **Flatpak/Snap browsers** (Linux) can't launch the helper out of the box. Use a regular package of the browser.
+- **Quick select finds nothing or says videos "couldn't be checked"**: update yt-dlp (`python3 install.py --force`; a system yt-dlp older than mid-2023 is too old) and look at `host.log`.
 - **Checkboxes don't appear**: YouTube changed its layout. The selectors are at the top of `extension/content.js`.
 - **Age-restricted/private videos**: add `--cookies-from-browser <browser>` in `build_cmd` in `host/yt_host.py`, then re-run the installer.
 

@@ -26,6 +26,7 @@ BIN_DIR = APP_DIR / "bin"
 IS_WIN = os.name == "nt"
 LOG_FILE = APP_DIR / "host.log"
 STAMP = APP_DIR / ".last_update_check"
+META_FILE = APP_DIR / "meta-cache.json"  # video id -> category/duration, so repeat lookups are instant
 UPDATE_EVERY = 24 * 3600  # seconds between yt-dlp self-updates
 
 ID_RE = re.compile(r"^[\w-]{11}$")
@@ -64,6 +65,15 @@ work = queue.Queue()
 procs = {}  # video id -> running yt-dlp process
 gen_counter = itertools.count(1)  # tells a re-queued job apart from its stale queue entry
 ready = threading.Event()  # set once the optional yt-dlp self-update finished
+
+INSPECT_WORKERS = 4
+RETRY_ERRORS_AFTER = 60  # seconds before a failed lookup may be tried again
+meta = {}  # video id -> {title, channel, duration, categories}   (persisted)
+meta_state = {}  # video id -> "queued" | {"error": str, "ts": float}   (this session only)
+meta_dirty = False
+meta_saved_at = 0.0
+inspect_q = queue.Queue()
+misc_procs = set()  # short-lived lookup processes, killed when the browser goes away
 
 
 # ---------- tools ----------
@@ -228,6 +238,131 @@ def worker():
             work.task_done()
 
 
+# ---------- video info lookups (for the extension's filters) ----------
+def load_meta():
+    try:
+        data = json.loads(META_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            meta.update({k: v for k, v in data.items() if ID_RE.match(k) and isinstance(v, dict)})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def save_meta(force=False):
+    global meta_dirty, meta_saved_at
+    with lock:
+        if not meta_dirty or (not force and time.time() - meta_saved_at < 5):
+            return
+        snapshot = json.dumps(meta)
+        meta_dirty = False
+        meta_saved_at = time.time()
+    try:
+        tmp = META_FILE.with_name(META_FILE.name + ".tmp")
+        tmp.write_text(snapshot, encoding="utf-8")
+        tmp.replace(META_FILE)
+    except Exception as e:  # noqa: BLE001
+        log(f"couldn't save meta cache: {e}")
+
+
+def run_capture(cmd, timeout):
+    p = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, errors="replace",
+        creationflags=0x08000000 if IS_WIN else 0, start_new_session=not IS_WIN,
+    )
+    with lock:
+        misc_procs.add(p)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(p)
+        p.communicate()
+        raise RuntimeError("timed out")
+    finally:
+        with lock:
+            misc_procs.discard(p)
+    return out, err
+
+
+def fetch_meta(vid):
+    cmd = ytdlp_cmd() + [
+        "--no-playlist", "--no-warnings", "--ignore-no-formats-error", "--skip-download",
+        "-O", "%(.{id,title,channel,duration,categories})j",
+        f"https://www.youtube.com/watch?v={vid}",
+    ]
+    out, err = run_capture(cmd, 90)
+    line = next((ln for ln in reversed(out.splitlines()) if ln.strip().startswith("{")), None)
+    if not line:
+        raise RuntimeError((err.strip().splitlines() or ["no data returned"])[-1][:200])
+    d = json.loads(line)
+    dur = d.get("duration")
+    return {
+        "title": str(d.get("title") or "")[:150],
+        "channel": str(d.get("channel") or "")[:80],
+        "duration": dur if isinstance(dur, (int, float)) else None,
+        "categories": [str(c) for c in (d.get("categories") or [])][:3],
+    }
+
+
+def inspect_worker():
+    global meta_dirty
+    ready.wait()
+    while True:
+        vid = inspect_q.get()
+        try:
+            with lock:
+                if meta_state.get(vid) != "queued":  # dropped by a cancel
+                    continue
+            info = fetch_meta(vid)
+            with lock:
+                meta[vid] = info
+                meta_state.pop(vid, None)
+                meta_dirty = True
+            save_meta()
+        except Exception as e:  # noqa: BLE001
+            log(f"lookup {vid} failed: {e}")
+            with lock:
+                if vid in meta_state:
+                    meta_state[vid] = {"error": str(e)[:200], "ts": time.time()}
+        finally:
+            inspect_q.task_done()
+
+
+def inspect_ids(req):
+    """Returns what is already known about the ids and queues lookups for the rest."""
+    if req.get("cancel"):
+        with lock:
+            while True:
+                try:
+                    vid = inspect_q.get_nowait()
+                except queue.Empty:
+                    break
+                meta_state.pop(vid, None)
+                inspect_q.task_done()
+        return {"cancelled": True}
+    ids = req.get("ids")
+    if not isinstance(ids, list):
+        raise ValueError("Bad request")
+    results, pending = {}, 0
+    now = time.time()
+    with lock:
+        for vid in [str(i) for i in ids[:500]]:
+            if not ID_RE.match(vid):
+                continue
+            st = meta_state.get(vid)
+            if vid in meta:
+                results[vid] = meta[vid]
+            elif st == "queued":
+                pending += 1
+            elif isinstance(st, dict) and now - st["ts"] < RETRY_ERRORS_AFTER:
+                results[vid] = {"error": st["error"]}
+            else:  # new, or an old failure worth retrying
+                meta_state[vid] = "queued"
+                inspect_q.put(vid)
+                pending += 1
+    return {"results": results, "pending": pending}
+
+
 def start_downloads(req):
     fmt, quality, items = req.get("format"), str(req.get("quality")), req.get("items")
     if fmt not in ("video", "mp3", "m4a") or not QUALITY_RE.match(quality):
@@ -286,6 +421,8 @@ def handle(msg):
         return start_downloads(msg.get("payload") or {})
     if kind == "cancel":
         return cancel_jobs(msg.get("payload") or {})
+    if kind == "inspect":
+        return inspect_ids(msg.get("payload") or {})
     if kind == "status":
         return status()
     if kind == "ping":
@@ -318,7 +455,10 @@ def main():
         msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
         msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
 
+    load_meta()
     threading.Thread(target=maintenance, daemon=True).start()
+    for _ in range(INSPECT_WORKERS):
+        threading.Thread(target=inspect_worker, daemon=True).start()
     for _ in range(WORKERS):
         threading.Thread(target=worker, daemon=True).start()
 
@@ -336,8 +476,9 @@ def main():
     finally:
         # Browser went away: stop children (partial .part files resume next time).
         with lock:
-            for p in list(procs.values()):
+            for p in list(procs.values()) + list(misc_procs):
                 kill_tree(p)
+        save_meta(force=True)
 
 
 if __name__ == "__main__":

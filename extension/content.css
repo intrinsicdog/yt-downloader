@@ -4,6 +4,7 @@
   width: 250px; padding: 12px; border-radius: 12px;
   background: #212121; color: #fff; font: 13px/1.4 Roboto, Arial, sans-serif;
   box-shadow: 0 4px 20px rgba(0,0,0,.5);
+  max-height: calc(100vh - 32px); overflow-y: auto; /* the Quick select section can make it tall */
   transition: opacity .25s ease, transform .25s ease, visibility 0s;
 }
 /* hidden = off the history page; animates out, then becomes unreachable */
@@ -30,6 +31,23 @@
 #ythd-panel .ythd-num { display: inline-block; min-width: 1.2em; text-align: right; font-variant-numeric: tabular-nums; }
 #ythd-panel .ythd-status { margin-top: 8px; white-space: pre-line; opacity: .9; word-break: break-word; }
 #ythd-panel .ythd-status.ythd-error { color: #ff7b7b; }
+
+/* ---------- Quick select ---------- */
+#ythd-panel .ythd-quick { margin-bottom: 8px; }
+#ythd-panel .ythd-quick summary { cursor: pointer; font-weight: 700; margin-bottom: 8px; user-select: none; }
+#ythd-panel .ythd-hint { font-size: 11px; opacity: .65; margin-bottom: 8px; }
+#ythd-panel .ythd-pair { display: flex; align-items: center; gap: 4px; }
+#ythd-panel .ythd-num-in {
+  width: 52px; background: #3a3a3a; color: #fff; border: 0; border-radius: 6px; padding: 4px 6px;
+  font: inherit; -moz-appearance: textfield;
+}
+#ythd-panel .ythd-num-in:disabled, #ythd-panel select:disabled { opacity: .5; }
+#ythd-panel .ythd-run { background: #3ea6ff; color: #000; font-weight: 700; }
+#ythd-panel .ythd-run:hover { background: #65b8ff; }
+#ythd-panel .ythd-stop { background: #5a2a2a; }
+#ythd-panel .ythd-stop:hover { background: #7a3535; }
+#ythd-panel .ythd-fstatus { font-size: 12px; opacity: .9; word-break: break-word; }
+#ythd-panel .ythd-fstatus.ythd-error { color: #ff7b7b; }
 
 /* overall progress: collapsed until a batch exists */
 #ythd-panel .ythd-overall {

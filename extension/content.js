@@ -58,6 +58,7 @@
     const quality = el("select");
     const go = el("button", { class: "ythd-go", text: "Download", disabled: "" });
     const status = el("div", { class: "ythd-status" });
+    const quick = buildQuick();
 
     const fill = el("div", { class: "ythd-fill" });
     const pct = el("span", { class: "ythd-pct", text: "0% overall" });
@@ -82,6 +83,7 @@
         count),
       el("div", { class: "ythd-row" }, el("label", { text: "Format " }, format)),
       el("div", { class: "ythd-row" }, el("label", { text: "Quality " }, quality)),
+      quick.root,
       go,
       overall,
       status);
@@ -90,7 +92,9 @@
 
     go.addEventListener("click", startDownload);
     cancelAll.addEventListener("click", () => cancelIds(null));
-    ui = { panel, num, format, quality, go, status, overall, fill, pct, cancelAll };
+    quick.run.addEventListener("click", runQuickSelect);
+    quick.stop.addEventListener("click", stopQuickSelect);
+    ui = { panel, num, format, quality, go, status, overall, fill, pct, cancelAll, quick };
   }
 
   function setStatus(text, isError = false) {
@@ -322,6 +326,205 @@
       clearInterval(pollTimer);
       pollTimer = null;
     }
+  }
+
+  // ---------- Quick select: filters, ranges and "N most recent" ----------
+  // Songs are detected with YouTube's own category ("Music"), fetched through the helper
+  // (yt-dlp) and cached, because the history page itself doesn't say what a video is.
+  const MAX_SCAN = 1000; // stop after checking this many videos
+  const BATCH = 12;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const metaById = new Map(); // videoId -> {categories, duration, ...} or {error}
+  let quickState = null;
+
+  function buildQuick() {
+    const type = el("select", {},
+      el("option", { value: "any", text: "Any video" }),
+      el("option", { value: "song", text: "Songs (Music)" }),
+      el("option", { value: "other", text: "Not songs" }));
+    const field = (ph, val = "") => el("input", {
+      type: "number", min: "0", step: "1", placeholder: ph, value: String(val), class: "ythd-num-in",
+    });
+    const minLen = field("min");
+    const maxLen = field("max");
+    const from = field("1", 1);
+    const to = field("30", 30);
+    const run = el("button", { class: "ythd-run", text: "Select" });
+    const stop = el("button", { class: "ythd-stop", text: "Stop", hidden: "" });
+    const status = el("div", { class: "ythd-fstatus" });
+    const root = el("details", { class: "ythd-quick" },
+      el("summary", { text: "Quick select" }),
+      el("div", { class: "ythd-hint", text: "Songs, 1–30 = your 30 most recent songs. Numbers count matching videos only." }),
+      el("div", { class: "ythd-row" }, el("label", { text: "Type " }, type)),
+      el("div", { class: "ythd-row" },
+        el("label", { text: "Length (min) " }, el("span", { class: "ythd-pair" }, minLen, "–", maxLen))),
+      el("div", { class: "ythd-row" },
+        el("label", { text: "Videos # ", title: "Position among matching videos; 1 = most recent" },
+          el("span", { class: "ythd-pair" }, from, "–", to))),
+      el("div", { class: "ythd-row" }, run, stop),
+      status);
+    return { root, type, minLen, maxLen, from, to, run, stop, status };
+  }
+
+  function readFilter() {
+    const q = ui.quick;
+    const num = (inp) => {
+      const v = parseFloat(inp.value);
+      return Number.isFinite(v) && v >= 0 ? v : null;
+    };
+    const from = Math.max(1, Math.floor(num(q.from) || 1));
+    const to = Math.max(from, Math.floor(num(q.to) || 30));
+    return { type: q.type.value, minLen: num(q.minLen), maxLen: num(q.maxLen), from, to };
+  }
+
+  function matches(m, f) {
+    if (!m || m.error) return false;
+    const isSong = (m.categories || []).includes("Music");
+    if (f.type === "song" && !isSong) return false;
+    if (f.type === "other" && isSong) return false;
+    if (f.minLen != null || f.maxLen != null) {
+      if (typeof m.duration !== "number") return false;
+      if (f.minLen != null && m.duration < f.minLen * 60) return false;
+      if (f.maxLen != null && m.duration > f.maxLen * 60) return false;
+    }
+    return true;
+  }
+
+  function setQuickStatus(text, isError = false) {
+    ui.quick.status.textContent = text;
+    ui.quick.status.classList.toggle("ythd-error", isError);
+  }
+
+  function setQuickBusy(busy) {
+    const q = ui.quick;
+    q.run.hidden = busy;
+    q.stop.hidden = !busy;
+    [q.type, q.minLen, q.maxLen, q.from, q.to].forEach((n) => { n.disabled = busy; });
+  }
+
+  // Append newly seen videos (history order = newest first) to state.ids.
+  function collectIds(state) {
+    let added = 0;
+    document.querySelectorAll(LINK_SEL).forEach((a) => {
+      const m = (a.getAttribute("href") || "").match(ID_RE);
+      if (!m || state.seen.has(m[1])) return;
+      const box = a.closest(BOX_SEL);
+      if (!box) return;
+      state.seen.add(m[1]);
+      state.ids.push(m[1]);
+      state.titles.set(m[1], boxTitle(box));
+      added++;
+    });
+    return added;
+  }
+
+  // YouTube loads more history as you scroll. Returns false at the end of the history.
+  async function loadMore(state) {
+    for (let attempt = 0; attempt < 2 && !state.abort; attempt++) {
+      if (attempt) window.scrollBy(0, -600); // nudge, in case the loader didn't trigger
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      for (let i = 0; i < 10 && !state.abort; i++) {
+        await sleep(300);
+        if (collectIds(state) > 0) return true;
+      }
+    }
+    return false;
+  }
+
+  async function resolveMeta(ids, state) {
+    let todo = ids.filter((id) => !metaById.has(id));
+    while (todo.length && !state.abort) {
+      const r = await send({ type: "inspect", payload: { ids: todo } });
+      if (!r.ok) throw new Error(r.error);
+      for (const [id, m] of Object.entries(r.data.results || {})) metaById.set(id, m);
+      todo = todo.filter((id) => !metaById.has(id));
+      if (todo.length) await sleep(700);
+    }
+  }
+
+  function applySelection(ids, titles) {
+    selected.clear();
+    for (const id of ids) selected.set(id, titles.get(id) || "video");
+    document.querySelectorAll(".ythd-cb").forEach((cb) => {
+      const on = selected.has(cb.dataset.id);
+      if (cb.checked !== on) {
+        cb.checked = on;
+        play(cb, "ythd-pop");
+      }
+    });
+    refreshCount();
+  }
+
+  async function runQuickSelect() {
+    if (quickState) return;
+    const f = readFilter();
+    const state = { abort: false, seen: new Set(), ids: [], titles: new Map() };
+    quickState = state;
+    setQuickBusy(true);
+    for (const [id, m] of [...metaById]) if (m.error) metaById.delete(id); // retry earlier failures
+
+    const needMeta = f.type !== "any" || f.minLen != null || f.maxLen != null;
+    const noun = f.type === "song" ? "song" : f.type === "other" ? "non-song video" : "video";
+    const matched = [];
+    let evaluated = 0, unknown = 0, ended = false;
+    try {
+      while (!state.abort && matched.length < f.to && evaluated < MAX_SCAN) {
+        collectIds(state);
+        if (evaluated >= state.ids.length) {
+          setQuickStatus(`Loading more history… ${state.ids.length} videos so far`);
+          if (!(await loadMore(state))) {
+            ended = !state.abort;
+            break;
+          }
+          continue;
+        }
+        const batch = state.ids.slice(evaluated, evaluated + BATCH);
+        if (needMeta) {
+          setQuickStatus(`Checking videos ${evaluated + 1}–${evaluated + batch.length}… ${matched.length} found`);
+          await resolveMeta(batch, state);
+          if (state.abort) break;
+        } else {
+          setQuickStatus(`Counting… ${state.ids.length} videos loaded`);
+        }
+        for (const id of batch) {
+          if (matched.length >= f.to) break;
+          evaluated++;
+          const m = metaById.get(id);
+          if (needMeta && m && m.error) unknown++;
+          if (!needMeta || matches(m, f)) matched.push(id);
+        }
+      }
+      if (state.abort) {
+        setQuickStatus("Stopped. Your selection was not changed.");
+        return;
+      }
+      const picked = matched.slice(f.from - 1, f.to);
+      const wanted = f.to - f.from + 1;
+      if (picked.length) {
+        applySelection(picked, state.titles);
+        window.scrollTo(0, 0);
+      }
+      const tail = unknown ? ` (${unknown} couldn't be checked)` : "";
+      if (!picked.length) {
+        setQuickStatus(`No matching ${noun}s found in ${evaluated} videos checked${tail}.`);
+      } else if (picked.length < wanted) {
+        const why = ended ? "reached the end of your history" : "hit the scan limit";
+        setQuickStatus(`Selected ${picked.length} ${noun}${picked.length === 1 ? "" : "s"} only: ${why} after ${evaluated} videos${tail}.`);
+      } else {
+        setQuickStatus(`Selected ${picked.length} ${noun}${picked.length === 1 ? "" : "s"} (#${f.from}–${f.to}), ${evaluated} videos checked${tail}.`);
+      }
+    } catch (e) {
+      setQuickStatus(e.message || String(e), true);
+    } finally {
+      quickState = null;
+      setQuickBusy(false);
+    }
+  }
+
+  function stopQuickSelect() {
+    if (!quickState) return;
+    quickState.abort = true;
+    send({ type: "inspect", payload: { cancel: true } }); // drop lookups that haven't started
   }
 
   // ---------- SPA-aware lifecycle ----------
